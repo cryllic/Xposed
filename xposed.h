@@ -3,6 +3,8 @@
 
 #include "xposed_shared.h"
 
+#define XPOSED_PROP_FILE "/system/xposed.prop"
+
 #if defined(__LP64__)
   #define XPOSED_LIB_DIR "/system/lib64/"
 #else
@@ -21,8 +23,12 @@
 
 #if XPOSED_WITH_SELINUX
 #include <selinux/selinux.h>
-static security_context_t ctx_system = (security_context_t) "u:r:system_server:s0";
-static security_context_t ctx_app =    (security_context_t) "u:r:untrusted_app:s0";
+#define ctx_system ((security_context_t) "u:r:system_server:s0")
+#if PLATFORM_SDK_VERSION >= 23
+#define ctx_app    ((security_context_t) "u:r:untrusted_app:s0:c512,c768")
+#else
+#define ctx_app    ((security_context_t) "u:r:untrusted_app:s0")
+#endif  // PLATFORM_SDK_VERSION >= 23
 #endif  // XPOSED_WITH_SELINUX
 
 namespace xposed {
@@ -30,6 +36,7 @@ namespace xposed {
     bool handleOptions(int argc, char* const argv[]);
     bool initialize(bool zygote, bool startSystemServer, const char* className, int argc, char* const argv[]);
     void printRomInfo();
+    void parseXposedProp();
     int getSdkVersion();
     bool isDisabled();
     void disableXposed();
@@ -37,9 +44,12 @@ namespace xposed {
     bool shouldSkipSafemodeDelay();
     bool shouldIgnoreCommand(int argc, const char* const argv[]);
     bool addJarToClasspath();
+#if PLATFORM_SDK_VERSION >= 21
+    void htcAdjustSystemServerClassPath();
+#endif
     void onVmCreated(JNIEnv* env);
     void setProcessName(const char* name);
-    void dropCapabilities(int keep = 0);
+    void dropCapabilities(int8_t keep[] = NULL);
 
 }  // namespace xposed
 

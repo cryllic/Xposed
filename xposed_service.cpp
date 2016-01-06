@@ -15,6 +15,8 @@
 #include <binder/ProcessState.h>
 #include <errno.h>
 #include <fcntl.h>
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 #include <sys/mman.h>
 
 #define UID_SYSTEM 1000
@@ -190,12 +192,14 @@ void* looper(void* unused __attribute__((unused))) {
                     break;
                 }
 
-                if (data->offset > 0)
-                    fseek(f, data->offset, SEEK_SET);
+                if (data->offset > 0 && fseek(f, data->offset, SEEK_SET) != 0) {
+                    shared->error = ferror(f);
+                    fclose(f);
+                    break;
+                }
 
-                errno = 0;
                 data->bytesRead = fread(data->content, 1, sizeof(data->content), f);
-                shared->error = errno;
+                shared->error = ferror(f);
                 data->eof = feof(f);
 
                 fclose(f);
@@ -279,7 +283,6 @@ int accessFile(const char* path, int mode) {
 
     callService(OP_ACCESS_FILE);
 
-    bail:
     makeIdle();
     errno = shared->error;
     return shared->error ? -1 : data->result;
@@ -303,7 +306,6 @@ int statFile(const char* path, struct stat* st) {
 
     memcpy(st, &data->st, sizeof(struct stat));
 
-    bail:
     makeIdle();
     errno = shared->error;
     return shared->error ? -1 : data->result;
@@ -398,7 +400,8 @@ class IXposedService: public IInterface {
                                   int64_t* size,
                                   int64_t* mtime,
                                   uint8_t** buffer,
-                                  int32_t* bytesRead) const = 0;
+                                  int32_t* bytesRead,
+                                  String16* errormsg) const = 0;
 
         enum {
             TEST_TRANSACTION = IBinder::FIRST_CALL_TRANSACTION,
@@ -463,13 +466,13 @@ class BpXposedService: public BpInterface<IXposedService> {
 
             int64_t size1 = reply.readInt64();
             int64_t mtime1 = reply.readInt64();
-            if (size != NULL) size1 = *size;
-            if (mtime != NULL) mtime1 = *mtime;
+            if (size != NULL) *size = size1;
+            if (mtime != NULL) *mtime = mtime1;
             return 0;
         }
 
         virtual status_t readFile(const String16& filename, int32_t offset, int32_t length,
-                int64_t* size, int64_t* mtime, uint8_t** buffer, int32_t* bytesRead) const {
+                int64_t* size, int64_t* mtime, uint8_t** buffer, int32_t* bytesRead, String16* errormsg) const {
             Parcel data, reply;
             data.writeInterfaceToken(IXposedService::getInterfaceDescriptor());
             data.writeString16(filename);
@@ -486,12 +489,14 @@ class BpXposedService: public BpInterface<IXposedService> {
             if (reply.readExceptionCode() != 0) return -1;
 
             status_t err = reply.readInt32();
+            const String16& errormsg1(reply.readString16());
             size1 = reply.readInt64();
             mtime1 = reply.readInt64();
             int32_t bytesRead1 = reply.readInt32();
             if (size != NULL) *size = size1;
             if (mtime != NULL) *mtime = mtime1;
             if (bytesRead != NULL) *bytesRead = bytesRead1;
+            if (errormsg) *errormsg = errormsg1;
 
             if (bytesRead1 > 0 && bytesRead1 <= (int32_t)reply.dataAvail()) {
                 *buffer = (uint8_t*) malloc(bytesRead1 + 1);
@@ -540,7 +545,6 @@ status_t BnXposedService::onTransact(uint32_t code, const Parcel& data, Parcel* 
         case STAT_FILE_TRANSACTION: {
             CHECK_INTERFACE(IXposedService, data, reply);
             String16 filename = data.readString16();
-            int32_t mode = data.readInt32();
             int64_t size, time;
             status_t result = statFile(filename, &size, &time);
             int err = errno;
@@ -564,20 +568,18 @@ status_t BnXposedService::onTransact(uint32_t code, const Parcel& data, Parcel* 
             int64_t mtime = data.readInt64();
             uint8_t* buffer = NULL;
             int32_t bytesRead = -1;
+            String16 errormsg;
 
-            status_t err = readFile(filename, offset, length, &size, &mtime, &buffer, &bytesRead);
+            status_t err = readFile(filename, offset, length, &size, &mtime, &buffer, &bytesRead, &errormsg);
 
             reply->writeNoException();
             reply->writeInt32(err);
+            reply->writeString16(errormsg);
             reply->writeInt64(size);
             reply->writeInt64(mtime);
             if (bytesRead > 0) {
-#if PLATFORM_SDK_VERSION >= 21
-                reply->writeByteArray(bytesRead, buffer);
-#else
                 reply->writeInt32(bytesRead);
                 reply->write(buffer, bytesRead);
-#endif
                 free(buffer);
             } else {
                 reply->writeInt32(bytesRead); // empty array (0) or null (-1)
@@ -609,11 +611,23 @@ class XposedService : public BnXposedService {
                                   int64_t* size,
                                   int64_t* mtime,
                                   uint8_t** buffer,
-                                  int32_t* bytesRead) const;
+                                  int32_t* bytesRead,
+                                  String16* errormsg) const;
 
     private:
         bool isSystem;
 };
+
+static String16 formatToString16(const char* fmt, ...) {
+    char* message;
+    va_list args;
+    va_start(args, fmt);
+    int size = vasprintf(&message, fmt, args);
+    String16 result(message, size);
+    free(message);
+    va_end(args);
+    return result;
+}
 
 XposedService::XposedService(bool system)
         : isSystem(system) {}
@@ -669,7 +683,7 @@ status_t XposedService::statFile(const String16& filename16, int64_t* size, int6
 }
 
 status_t XposedService::readFile(const String16& filename16, int32_t offset, int32_t length,
-        int64_t* size, int64_t* mtime, uint8_t** buffer, int32_t* bytesRead) const {
+        int64_t* size, int64_t* mtime, uint8_t** buffer, int32_t* bytesRead, String16* errormsg) const {
 
     uid_t caller = IPCThreadState::self()->getCallingUid();
     if (caller != UID_SYSTEM) {
@@ -684,10 +698,13 @@ status_t XposedService::readFile(const String16& filename16, int32_t offset, int
     const char* filename = String8(filename16).string();
     struct stat st;
     if (stat(filename, &st) != 0) {
-        return errno;
+        status_t err = errno;
+        if (errormsg) *errormsg = formatToString16("%s during stat() on %s", strerror(err), filename);
+        return err;
     }
 
     if (S_ISDIR(st.st_mode)) {
+        if (errormsg) *errormsg = formatToString16("%s is a directory", filename);
         return EISDIR;
     }
 
@@ -701,12 +718,14 @@ status_t XposedService::readFile(const String16& filename16, int32_t offset, int
 
     // Check range
     if (offset > 0 && offset >= *size) {
+        if (errormsg) *errormsg = formatToString16("offset %d >= size %" PRId64 " for %s", offset, *size, filename);
         return EINVAL;
     } else if (offset < 0) {
         offset = 0;
     }
 
     if (length > 0 && (offset + length) > *size) {
+        if (errormsg) *errormsg = formatToString16("offset %d + length %d > size %" PRId64 " for %s", offset, length, *size, filename);
         return EINVAL;
     } else if (*size == 0) {
         *bytesRead = 0;
@@ -718,6 +737,7 @@ status_t XposedService::readFile(const String16& filename16, int32_t offset, int
     // Allocate buffer
     *buffer = (uint8_t*) malloc(length + 1);
     if (*buffer == NULL) {
+        if (errormsg) *errormsg = formatToString16("allocating buffer with %d bytes failed", length + 1);
         return ENOMEM;
     }
     (*buffer)[length] = 0;
@@ -728,25 +748,28 @@ status_t XposedService::readFile(const String16& filename16, int32_t offset, int
         status_t err = errno;
         free(*buffer);
         *buffer = NULL;
+        if (errormsg) *errormsg = formatToString16("%s during fopen() on %s", strerror(err), filename);
         return err;
     }
 
     // Seek to correct offset
-    if (offset > 0) {
-        fseek(f, offset, SEEK_SET);
+    if (offset > 0 && fseek(f, offset, SEEK_SET) != 0) {
+        free(*buffer);
+        *buffer = NULL;
+        status_t err = ferror(f);
+        fclose(f);
+        if (errormsg) *errormsg = formatToString16("%s during fseek() to offset %d for %s", strerror(err), offset, filename);
+        return err;
     }
 
     // Read the file
-    errno = 0;
     *bytesRead = fread(*buffer, 1, length, f);
-    status_t err = errno;
-    if (*bytesRead < length) {
-        err = EIO;
-    }
+    status_t err = ferror(f);
     if (err != 0) {
         free(*buffer);
         *buffer = NULL;
         *bytesRead = -1;
+        if (errormsg) *errormsg = formatToString16("%s during fread(), read %d bytes for %s", strerror(err), *bytesRead, filename);
     }
 
     // Close the file
